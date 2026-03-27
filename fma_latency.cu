@@ -31,6 +31,13 @@ fma_latency(data_type *n, unsigned long long *d_start, unsigned long long *d_end
     __threadfence();
     start_time = clock_cycle();
 
+    int num_iters = 100;
+    for (int i = 0; i < num_iters; i++) {
+        // FMA op
+        x *= 2.0f;
+        x += 5.0f;
+    }
+
     /// <--- /your code here --->
 
     end_time = clock_cycle();
