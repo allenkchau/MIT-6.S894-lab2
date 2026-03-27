@@ -299,7 +299,34 @@ void mandelbrot_cpu_vector_multicore_multithread(
     uint32_t img_size,
     uint32_t max_iters,
     uint32_t *out) {
-    // TODO: Implement this function.
+
+    // now we can do multiple threads per core
+    int num_threads = 100;
+    int rowsPerThread = img_size / num_threads;
+    int remainder = img_size % num_threads;
+
+    // create a vector for our threads and ThreadArgs
+    std::vector<pthread_t> threads(num_threads);
+    std::vector<ThreadArgs> thread_args(num_threads);
+    
+    // create our threads, 1 for each core on the cpu
+    // pthread_create runs the worker function when we create the thread
+    for (int t = 0; t < num_threads; t++) {
+        thread_args[t].img_size = img_size;
+        thread_args[t].max_iters = max_iters;
+        thread_args[t].out = out;
+        int start = t * rowsPerThread + std::min(t, remainder);
+        int end = start + rowsPerThread + (t < remainder ? 1: 0);
+
+        thread_args[t].row_begin = start;
+        thread_args[t].row_end = end;
+        pthread_create(&threads[t], nullptr, worker_fn, &thread_args[t]);
+    }
+
+    // synchronize on the completion for all our threads
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], nullptr);
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
