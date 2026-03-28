@@ -9,6 +9,8 @@
 #include <immintrin.h>
 #include <pthread.h>
 #include <vector>
+#include <thread>
+#include <iostream>
 
 constexpr float window_zoom = 1.0 / 10000.0f;
 constexpr float window_x = -0.743643887 - 0.5 * window_zoom;
@@ -148,7 +150,86 @@ void mandelbrot_cpu_vector(uint32_t img_size, uint32_t max_iters, uint32_t *out)
 // Vector + ILP
 
 void mandelbrot_cpu_vector_ilp(uint32_t img_size, uint32_t max_iters, uint32_t *out) {
-    // TODO: Implement this function.
+    __m256i one = _mm256_set1_epi32(1);
+    __m256 four_float = _mm256_set1_ps(4.0f);
+    __m256 window_x_vec = _mm256_set1_ps(window_x);
+    __m256 window_zoom_vec = _mm256_set1_ps(window_zoom);
+    __m256 img_size_vec = _mm256_set1_ps((float)img_size);
+    __m256i max_iters_vec = _mm256_set1_epi32((int)max_iters);
+
+    for (uint64_t i = 0; i < img_size; ++i) {
+        for (uint64_t j = 0; j < img_size; j += 8) {
+            // build the lanes for cx:
+            // float cx = (float(j) / float(img_size)) * 2.5f - 2.0f;
+            __m256i offset = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+            __m256i j_vec = _mm256_set1_epi32((int)j);
+            __m256i cx_1 = _mm256_add_epi32(offset, j_vec);
+            __m256 cx_1_float = _mm256_cvtepi32_ps(cx_1);
+            __m256 cx_2 = _mm256_div_ps(cx_1_float, img_size_vec);
+            __m256 cx_3 = _mm256_mul_ps(cx_2, window_zoom_vec);
+            __m256 cx = _mm256_add_ps(cx_3, window_x_vec);
+
+            // cy doesn't change because we process the same row
+            float cy_scalar = (float(i) / float(img_size)) * window_zoom + window_y;
+            __m256 cy = _mm256_set1_ps(cy_scalar);
+
+            // Innermost loop: start the recursion from z = 0.
+            __m256 x2 = _mm256_set1_ps(0.0f);
+            __m256 y2 = _mm256_set1_ps(0.0f);
+            __m256 w = _mm256_set1_ps(0.0f);
+
+            // keep track of iters
+            __m256i iters = _mm256_set1_epi32(0);
+
+            // active condition:
+            // x2 + y2 <= 4.0f && iters < max_iters
+            __m256 x2_and_y2 = _mm256_add_ps(x2, y2);
+            __m256 first_cond = _mm256_cmp_ps(x2_and_y2, four_float, _CMP_LE_OQ);
+            __m256i second_cond_i = _mm256_cmpgt_epi32(max_iters_vec, iters);
+            __m256 second_cond = _mm256_castsi256_ps(second_cond_i);
+            __m256 active = _mm256_and_ps(first_cond, second_cond);
+
+            while (_mm256_movemask_ps(active)) {
+                // calculate x: float x = x2 - y2 + cx;
+                __m256 x_1 = _mm256_sub_ps(x2, y2);
+                __m256 x = _mm256_add_ps(x_1, cx);
+
+                // calculate y: float y = w - x2 - y2 + cy;
+                __m256 y_1 = _mm256_add_ps(x2, y2);
+                __m256 y_2 = _mm256_sub_ps(w, y_1);
+                __m256 y = _mm256_add_ps(y_2, cy);
+
+                // calculate x2: x * x;
+                __m256 new_x2 = _mm256_mul_ps(x, x);
+                x2 = _mm256_blendv_ps(x2, new_x2, active);
+
+                // calculate y2: y * y;
+                __m256 new_y2 = _mm256_mul_ps(y, y);
+                y2 = _mm256_blendv_ps(y2, new_y2, active);
+
+                // calculate float z = x + y;
+                __m256 z = _mm256_add_ps(x, y);
+
+                // calculate w = z * z;
+                __m256 new_w = _mm256_mul_ps(z, z);
+                w = _mm256_blendv_ps(w, new_w, active);
+
+                // ++iters;
+                __m256i active_i = _mm256_castps_si256(active);
+                __m256i incr = _mm256_and_si256(active_i, one);
+                iters = _mm256_add_epi32(iters, incr);
+
+                x2_and_y2 = _mm256_add_ps(x2, y2);
+                first_cond = _mm256_cmp_ps(x2_and_y2, four_float, _CMP_LE_OQ);
+                second_cond_i = _mm256_cmpgt_epi32(max_iters_vec, iters);
+                second_cond = _mm256_castsi256_ps(second_cond_i);
+                active = _mm256_and_ps(first_cond, second_cond);
+            }
+
+            // Write result.
+            _mm256_storeu_si256((__m256i*)(&out[i * img_size + j]), iters);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -258,13 +339,28 @@ void* worker_fn(void* arg) {
     return nullptr;
 }
 
+// helper to get threads per core
+int get_threads_per_core() {
+    FILE* fp = popen("lscpu | grep 'Thread(s) per core' | awk '{print $4}'", "r");
+    if (!fp) return 1;
+
+    int val = 1;
+    if (fscanf(fp, "%d", &val) != 1) {
+        val = 1;
+    }
+    pclose(fp);
+    return val;
+}
+
 void mandelbrot_cpu_vector_multicore(
     uint32_t img_size,
     uint32_t max_iters,
     uint32_t *out) {
     
     // number of cores on our cpu
-    int num_threads = 4;
+    int logical = std::thread::hardware_concurrency();
+    int threadsPerCore = get_threads_per_core();
+    int num_threads = logical / threadsPerCore;
     int rowsPerThread = img_size / num_threads;
     int remainder = img_size % num_threads;
 
@@ -301,7 +397,7 @@ void mandelbrot_cpu_vector_multicore_multithread(
     uint32_t *out) {
 
     // now we can do multiple threads per core
-    int num_threads = 100;
+    int num_threads = std::thread::hardware_concurrency() * 10;
     int rowsPerThread = img_size / num_threads;
     int remainder = img_size % num_threads;
 
